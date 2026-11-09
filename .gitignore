@@ -8,3 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Logs, cache et resultats generes
+logs/
+*.log
+geo_cache.json
+output/
