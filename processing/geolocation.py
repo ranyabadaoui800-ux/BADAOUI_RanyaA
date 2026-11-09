@@ -1,20 +1,24 @@
 import json
 import os
+import time
 
 import requests as http
 
 from logger_config import get_logger
 
 """
-Module geolocation : trouve le pays d'une adresse IP avec l'API ipinfo.io
-Pour ne pas appeler l'API plusieurs fois pour la meme IP, on garde un cache
-dans un fichier json (geo_cache.json).
+Module geolocation : trouve le pays des adresses IP avec l'API ip-api.com
+On utilise le mode "batch" : on envoie 100 IP par requete (au lieu d'une requete par IP).
+La version gratuite autorise 15 requetes batch par minute -> on attend 4.5 s entre chaque.
+Pour ne pas redemander les memes IP, on garde un cache dans geo_cache.json.
 """
 
 logger = get_logger("processing")
 
 CACHE_FILE = "geo_cache.json"
-API_URL = "https://ipinfo.io/{}/json"
+API_URL = "http://ip-api.com/batch?fields=status,message,countryCode,query"
+BATCH_SIZE = 100
+WAIT_SECONDS = 4.5
 UNKNOWN = "Inconnu"
 LOCAL = "Local"
 
@@ -50,57 +54,65 @@ def is_private(ip: str) -> bool:
     return False
 
 
-def geo_location(ip: str) -> str:
-    # retourne le code pays (ex: "FR", "CN") ou "Local" / "Inconnu"
-    if is_private(ip):
-        logger.debug(f"{ip} est une IP privee")
-        return LOCAL
+def geo_batch(ips: list) -> dict:
+    # envoie une liste d'IP (max 100) et retourne {ip: code_pays}
+    result = {}
     try:
-        response = http.get(API_URL.format(ip), timeout=5)
+        response = http.post(API_URL, json=ips, timeout=15)
         if response.status_code == 429:
-            logger.error("Limite de l'API ipinfo atteinte (429)")
-            return UNKNOWN
+            logger.error("Limite de l'API atteinte (429), attente de 60 s")
+            time.sleep(60)
+            return result
         if response.status_code != 200:
-            logger.error(f"Reponse {response.status_code} de l'API pour {ip}")
-            return UNKNOWN
-        country = response.json().get("country")
-        if not country:
-            logger.warning(f"Pas de pays dans la reponse pour {ip}")
-            return UNKNOWN
-        return country
+            logger.error(f"Reponse {response.status_code} de l'API")
+            return result
+        for item in response.json():
+            if item.get("status") == "success" and item.get("countryCode"):
+                result[item["query"]] = item["countryCode"]
+            else:
+                logger.warning(f"Pas de pays pour {item.get('query')} : {item.get('message')}")
     except http.Timeout:
-        logger.error(f"Timeout de l'API pour {ip}")
+        logger.error("Timeout de l'API")
     except http.ConnectionError:
-        logger.error(f"Pas de connexion internet / API injoignable pour {ip}")
+        logger.error("Pas de connexion internet / API injoignable")
     except ValueError:
-        logger.error(f"Reponse JSON invalide pour {ip}")
+        logger.error("Reponse JSON invalide de l'API")
     except http.RequestException as e:
-        logger.error(f"Erreur requests pour {ip} : {e}")
-    return UNKNOWN
+        logger.error(f"Erreur requests : {e}")
+    return result
 
 
 def add_countries(events: list) -> list:
     # ajoute la cle "country" a chaque evenement
     cache = load_cache()
-    ips = {e["ip"] for e in events if e["ip"] not in cache}
+
+    for e in events:
+        if is_private(e["ip"]):
+            cache[e["ip"]] = LOCAL
+
+    ips = sorted({e["ip"] for e in events if e["ip"] not in cache})
     logger.info(f"{len(ips)} nouvelles IP a geolocaliser ({len(cache)} deja en cache)")
 
     errors_in_a_row = 0
-    for i, ip in enumerate(ips, start=1):
-        country = geo_location(ip)
-        if country == UNKNOWN:
+    for start in range(0, len(ips), BATCH_SIZE):
+        batch = ips[start:start + BATCH_SIZE]
+        found = geo_batch(batch)
+        if not found:
             errors_in_a_row += 1
-            if errors_in_a_row >= 5:
-                # 5 echecs de suite : l'API est surement inaccessible, on arrete
-                logger.error("5 erreurs de suite, arret de la geolocalisation")
+            if errors_in_a_row >= 3:
+                logger.error("3 erreurs de suite, arret de la geolocalisation")
                 break
         else:
             errors_in_a_row = 0
-            cache[ip] = country  # on ne met en cache que les vraies reponses
-        if i % 100 == 0:
-            logger.info(f"{i}/{len(ips)} IP geolocalisees")
-            save_cache(cache)
-    save_cache(cache)
+            cache.update(found)
+        save_cache(cache)
+        logger.info(f"{min(start + BATCH_SIZE, len(ips))}/{len(ips)} IP traitees")
+        if start + BATCH_SIZE < len(ips):
+            time.sleep(WAIT_SECONDS)  # respecter la limite de 15 requetes par minute
+
+    nb_unknown = sum(1 for e in events if e["ip"] not in cache)
+    if nb_unknown:
+        logger.warning(f"{nb_unknown} tentatives sans pays (Inconnu)")
 
     for e in events:
         e["country"] = cache.get(e["ip"], UNKNOWN)
@@ -108,4 +120,4 @@ def add_countries(events: list) -> list:
 
 
 if __name__ == "__main__":
-    print(geo_location("88.147.152.239"))
+    print(geo_batch(["88.147.152.239", "8.8.8.8"]))
