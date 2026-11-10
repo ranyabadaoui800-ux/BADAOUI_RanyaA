@@ -3,11 +3,12 @@ import sys
 from logger_config import get_logger
 from ingestion import read
 from processing import extract_transform, geolocation
-from storage import save
+from storage import save, database
 from serving import dashboard
 
 """
-Pipeline : ingestion -> processing (extraction + geolocalisation) -> storage -> serving (dashboard)
+Pipeline : ingestion -> processing (extraction + geolocalisation)
+        -> storage (PostgreSQL + CSV) -> serving (dashboard depuis la base)
 """
 
 logger = get_logger("main")
@@ -27,10 +28,14 @@ def run():
         return
 
     events = geolocation.add_countries(events)
-    save.save_events(events)
+    save.save_events(events)  # copie CSV
+
+    if not database.save_events(events):
+        logger.error("Enregistrement dans la base impossible, arret du pipeline")
+        return
 
     # "--no-show" : genere l'image sans ouvrir la fenetre
-    dashboard.show_dashboard(events, show="--no-show" not in sys.argv)
+    dashboard.show_dashboard(show="--no-show" not in sys.argv)
     logger.info("Pipeline termine")
 
 
