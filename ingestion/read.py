@@ -67,4 +67,5 @@ def ingest(path: str) -> list:
 
 if __name__ == "__main__":
     data = ingest("./data")
-    print(data[:5])
+    for line in data[:20]:  # affiche les 20 premieres lignes
+        print(line.strip())
